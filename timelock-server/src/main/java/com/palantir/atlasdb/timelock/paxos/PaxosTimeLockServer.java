@@ -40,6 +40,7 @@ import com.palantir.atlasdb.factory.ServiceCreator;
 import com.palantir.atlasdb.http.NotCurrentLeaderExceptionMapper;
 import com.palantir.atlasdb.timelock.TimeLockServer;
 import com.palantir.atlasdb.timelock.TimeLockServices;
+import com.palantir.atlasdb.timelock.TooManyRequestsExceptionMapper;
 import com.palantir.atlasdb.timelock.config.PaxosConfiguration;
 import com.palantir.atlasdb.timelock.config.TimeLockServerConfiguration;
 import com.palantir.atlasdb.util.AtlasDbMetrics;
@@ -48,12 +49,14 @@ import com.palantir.leader.PingableLeader;
 import com.palantir.leader.proxy.AwaitingLeadershipProxy;
 import com.palantir.lock.LockService;
 import com.palantir.lock.impl.LockServiceImpl;
+import com.palantir.lock.impl.RateLimitingLockService;
 import com.palantir.paxos.PaxosAcceptor;
 import com.palantir.paxos.PaxosLearner;
 import com.palantir.paxos.PaxosProposer;
 import com.palantir.remoting.ssl.SslSocketFactories;
 import com.palantir.timestamp.PersistentTimestampService;
 
+import io.dropwizard.server.DefaultServerFactory;
 import io.dropwizard.setup.Environment;
 
 public class PaxosTimeLockServer implements TimeLockServer {
@@ -66,6 +69,9 @@ public class PaxosTimeLockServer implements TimeLockServer {
     private LeaderElectionService leaderElectionService;
     private PaxosResource paxosResource;
 
+    private int maxServerThreads;
+    private int numClients;
+
     public PaxosTimeLockServer(PaxosConfiguration configuration, Environment environment) {
         this.paxosConfiguration = configuration;
         this.environment = environment;
@@ -74,6 +80,11 @@ public class PaxosTimeLockServer implements TimeLockServer {
     @Override
     public void onStartup(TimeLockServerConfiguration configuration) {
         registerPaxosResource();
+
+        maxServerThreads = ((DefaultServerFactory) configuration.getServerFactory()).getMaxThreads();
+        numClients = configuration.clients().size();
+
+        System.out.println("MAX SERVER THREADS: " + maxServerThreads);
 
         optionalSecurity = constructOptionalSslSocketFactory(paxosConfiguration);
 
@@ -108,6 +119,7 @@ public class PaxosTimeLockServer implements TimeLockServer {
                 localPaxosServices.ourAcceptor(),
                 localPaxosServices.ourLearner()));
         environment.jersey().register(new NotCurrentLeaderExceptionMapper());
+        environment.jersey().register(new TooManyRequestsExceptionMapper());
     }
 
     private void registerHealthCheck(TimeLockServerConfiguration configuration) {
@@ -155,7 +167,7 @@ public class PaxosTimeLockServer implements TimeLockServer {
                 LockService.class,
                 AwaitingLeadershipProxy.newProxyInstance(
                         LockService.class,
-                        LockServiceImpl::create,
+                        () -> RateLimitingLockService.create(LockServiceImpl.create(), maxServerThreads, numClients),
                         leaderElectionService),
                 client);
         return TimeLockServices.create(timestampService, lockService, timestampService);
